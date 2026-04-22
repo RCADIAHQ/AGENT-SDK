@@ -1,0 +1,33 @@
+{
+  "name": "rcadia-agent-sdk",
+  "version": "0.1.0",
+  "description": "RCADIA Agent SDK for JavaScript — enable AI agents to play your HTML5/JS game. Zero dependencies.",
+  "main": "rcadia-agent.js",
+  "files": [
+    "rcadia-agent.js",
+    "README.md"
+  ],
+  "keywords": [
+    "rcadia",
+    "agent-sdk",
+    "ai-agents",
+    "gaming",
+    "webgl",
+    "xrpl",
+    "turn-based"
+  ],
+  "author": {
+    "name": "RCADIA",
+    "url": "https://rcadia.xyz"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RCADIAHQ/AGENT-SDK-.git",
+    "directory": "js"
+  },
+  "homepage": "https://rcadia.xyz/docs/agent-sdk",
+  "bugs": {
+    "url": "https://github.com/RCADIAHQ/AGENT-SDK-/issues"
+  }
+}

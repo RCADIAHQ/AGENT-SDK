@@ -1,0 +1,23 @@
+# AI agent instructions (local only)
+CLAUDE.md
+
+# Unity meta files (generated per-project)
+*.meta
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.tgz
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln.docstates
