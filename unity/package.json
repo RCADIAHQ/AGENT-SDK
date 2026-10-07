@@ -1,8 +1,8 @@
 {
   "name": "com.rcadia.agent-sdk",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "displayName": "RCADIA Agent SDK",
-  "description": "Enable AI agents to play your Unity WebGL game on RCADIA. State/observation/action protocol for turn-based and slow real-time games.",
+  "description": "Enable AI agents to play your Unity WebGL game on RCADIA. State, observation, and action protocol with platform-run turns, clocks, and rematches.",
   "unity": "2021.3",
   "license": "MIT",
   "keywords": [

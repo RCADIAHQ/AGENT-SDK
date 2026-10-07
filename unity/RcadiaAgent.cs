@@ -1,115 +1,198 @@
 // ═══════════════════════════════════════════════════════════════════════
-//  RCADIA Agent SDK — Agentic game interface for AI agents
-//  https://rcadia.xyz
+//  RCADIA Agent SDK v2 for Unity WebGL
+//  https://rcadia.xyz/docs/agent-sdk
 //
-//  Add this file + RcadiaAgentBridge.jslib to your Unity project.
-//  Works alongside the existing RCADIA.cs SDK (Initialize, ConsumeLive, SubmitScore).
+//  Add this file, RcadiaAgentReceiver.cs and RcadiaAgentBridge.jslib to your
+//  Unity project (update all three together). Works alongside the existing
+//  RCADIA.cs SDK (Initialize, ConsumeLive, SubmitScore).
 //
-//  Game devs call 6 methods + listen to 3 events:
+//  Methods (game to platform):
+//    RcadiaAgent.Configure(config)                  declare agent support
+//    RcadiaAgent.SetState(stateJson)                public, authoritative state
+//    RcadiaAgent.SetObservation(pid, obsJson)       one player's private view
+//    RcadiaAgent.SetLegalActions(pid, actionsJson)  what the player on turn may do
+//    RcadiaAgent.RejectAction(pid, reason)          reject that player's last action
+//    RcadiaAgent.EndGame(resultJson)                report the result
+//    RcadiaAgent.Rematch()                          ask for another round
 //
-//  Methods (game → platform):
-//    RcadiaAgent.Configure(config)                — declare game supports agents
-//    RcadiaAgent.SetState(stateJson)              — push authoritative game state
-//    RcadiaAgent.SetObservation(pid, obsJson)     — push per-player view (hidden info)
-//    RcadiaAgent.SetLegalActions(pid, json)        — declare what a player can do
-//    RcadiaAgent.RejectAction(pid, reason)         — reject an invalid action
-//    RcadiaAgent.EndGame(resultJson)               — report game over
+//  Events (platform to game):
+//    OnGameStart(sessionId, players, round)         every seat filled: reset here
+//    OnAction(playerId, actionJson)                 a player's action
+//    OnActionDetail(playerId, actionJson, actionId) same action, with its id
+//    OnTimeout(playerId)                            player on turn ran out of time
+//    OnTimeoutDetail(playerId, strike, maxStrikes, final)
+//    OnSessionEnd(sessionId, resultJson, reason)    the platform ended the game
+//    OnActionRejected(playerId, reason)             kept for v1; never sent
 //
-//  Events (platform → game):
-//    RcadiaAgent.OnAction          += handler      — receive actions from agents
-//    RcadiaAgent.OnActionRejected  += handler      — action was rejected (feedback)
-//    RcadiaAgent.OnTimeout         += handler      — player timed out
-//
-//  The SDK is game-type agnostic. State and actions are opaque JSON —
-//  the SDK doesn't know if it's a card game, board game, RPG, or quiz.
+//  The SDK is game-type agnostic. State and actions are opaque JSON strings.
+//  Protocol: https://rcadia.xyz/sdk/AGENT_PROTOCOL_V2.md
 // ═══════════════════════════════════════════════════════════════════════
 
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 using UnityEngine;
 
 /// <summary>
-/// Configuration for an agent-compatible game.
+/// Configuration for an agent-compatible game. Field names match the JS SDK.
 /// </summary>
 [Serializable]
 public class AgentGameConfig
 {
-    /// <summary>Minimum players required to start.</summary>
+    /// <summary>Seats needed to start.</summary>
     public int minPlayers = 1;
 
-    /// <summary>Maximum players allowed.</summary>
+    /// <summary>Seats available.</summary>
     public int maxPlayers = 2;
 
-    /// <summary>Whether the game is turn-based (agents poll for state changes).</summary>
+    /// <summary>Turn-based games get turn enforcement and a clock.</summary>
     public bool turnBased = true;
 
-    /// <summary>Optional game type hint (e.g., "card", "board", "rpg", "quiz").</summary>
+    /// <summary>
+    /// Everyone on turn acts at once. The platform holds actions until every
+    /// player on turn has submitted, then delivers them together.
+    /// </summary>
+    public bool simultaneous = false;
+
+    /// <summary>Optional hint such as "chess", "card", "board", "quiz".</summary>
     public string gameType = "";
 
     /// <summary>
-    /// Turn timeout in seconds. 0 = no timeout.
-    /// Platform enforces: if an agent doesn't act within this window,
-    /// the game receives an OnTimeout event and decides what to do.
+    /// Seconds per turn. -1 (default) uses the platform default (300). 0 turns the clock off.
     /// </summary>
-    public int turnTimeout = 30;
+    public int turnTimeout = -1;
 
     /// <summary>
-    /// Whether all players act simultaneously before resolution.
-    /// When true, the platform holds actions until every player has submitted,
-    /// then delivers them all at once. Enables rock-paper-scissors, sealed-bid
-    /// auctions, and simultaneous-move strategy games.
+    /// Strikes before a forfeit. -1 (default) uses the platform default (2).
     /// </summary>
-    public bool simultaneous = false;
+    public int maxTurnTimeouts = -1;
+
+    /// <summary>
+    /// When true (default) the platform ends the game as a forfeit on the final strike.
+    /// Set false to handle the final strike yourself in OnTimeoutDetail.
+    /// </summary>
+    public bool forfeitOnTimeout = true;
+
+    /// <summary>Open the next round automatically, with the same players, when a game ends.</summary>
+    public bool autoRematch = false;
+
+    /// <summary>Protocol version. Set by the SDK; do not change.</summary>
+    public string sdkVersion = RcadiaAgent.Version;
+}
+
+/// <summary>Session info sent by the bridge on session start and game start.</summary>
+[Serializable]
+public class RcadiaAgentSessionInfo
+{
+    public string sessionId;
+    public int round;
+    public string[] players;
+}
+
+/// <summary>Action envelope sent by the bridge. The action itself stays an opaque JSON string.</summary>
+[Serializable]
+public class RcadiaAgentActionInfo
+{
+    public string playerId;
+    public string actionId;
+    public string actionJson;
+}
+
+/// <summary>Timeout details sent by the bridge. maxStrikes is -1 when unknown.</summary>
+[Serializable]
+public class RcadiaAgentTimeoutInfo
+{
+    public string playerId;
+    public int strike = 1;
+    public int maxStrikes = -1;
+    public bool final;
+}
+
+/// <summary>Sent when the platform ends a game (timeout, left, host_disconnected).</summary>
+[Serializable]
+public class RcadiaAgentSessionEndInfo
+{
+    public string sessionId;
+    public string resultJson;
+    public string reason;
 }
 
 /// <summary>
-/// RCADIA Agent SDK — enables AI agents to play Unity WebGL games.
+/// RCADIA Agent SDK. Lets AI agents (and humans) play Unity WebGL games on RCADIA.
 ///
-/// Games push state, observations, and legal actions through this SDK.
-/// The RCADIA platform relays them to connected agents via REST/WebSocket.
-/// Agents submit actions back through the platform, which arrive as
-/// OnAction events.
-///
-/// The SDK is completely game-type agnostic. All state and action payloads
-/// are opaque JSON strings — the game defines their structure.
-///
-/// For games with hidden information (card hands, fog of war), use
-/// SetObservation() to push per-player views. Each agent only sees
-/// their own observation, never the full state.
+/// In turn-based games one player is on turn at a time: the last player you
+/// published legal actions for. Keep calling SetLegalActions(currentPlayerId, moves);
+/// the platform clears every other player. The platform also runs the turn clock,
+/// refuses out-of-turn actions before they reach the game, and opens rematches.
 /// </summary>
 public static class RcadiaAgent
 {
+    /// <summary>Protocol version this SDK speaks.</summary>
+    public const string Version = "2.0.0";
+
     // ─── Events ──────────────────────────────────────────────────────
 
     /// <summary>
-    /// Fired when a player (human or agent) submits an action.
-    /// Parameters: (string playerId, string actionJson)
+    /// Every seat is filled and ready. Reset the game here and assign roles from
+    /// players (seat order). Fires again for each rematch round.
+    /// Parameters: (string sessionId, string[] players, int round)
+    /// </summary>
+    public static event Action<string, string[], int> OnGameStart;
+
+    /// <summary>
+    /// A player submitted an action. Parameters: (string playerId, string actionJson)
     /// </summary>
     public static event Action<string, string> OnAction;
 
     /// <summary>
-    /// Fired when an action is rejected as invalid.
-    /// Parameters: (string playerId, string reason)
+    /// Same as OnAction, plus the platform's actionId. Subscribe to one of the two, not both.
+    /// Parameters: (string playerId, string actionJson, string actionId)
     /// </summary>
-    public static event Action<string, string> OnActionRejected;
+    public static event Action<string, string, string> OnActionDetail;
 
     /// <summary>
-    /// Fired when a player's turn times out (no action within turnTimeout).
-    /// The game decides what to do: skip turn, forfeit, random action, etc.
+    /// The player on turn ran out of time. Kept for v1 games.
     /// Parameter: (string playerId)
     /// </summary>
     public static event Action<string> OnTimeout;
+
+    /// <summary>
+    /// The player on turn ran out of time. final is true on the last strike: the platform
+    /// then ends the game as a forfeit unless forfeitOnTimeout is false.
+    /// Parameters: (string playerId, int strike, int maxStrikes (-1 if unknown), bool final)
+    /// </summary>
+    public static event Action<string, int, int, bool> OnTimeoutDetail;
+
+    /// <summary>
+    /// The platform ended the game (timeout, left, host_disconnected). Show the result and
+    /// wait for OnGameStart. Parameters: (string sessionId, string resultJson, string reason)
+    /// </summary>
+    public static event Action<string, string, string> OnSessionEnd;
+
+    /// <summary>
+    /// Kept for v1 compatibility. The platform does not send rejections to games.
+    /// Parameters: (string playerId, string reason)
+    /// </summary>
+    public static event Action<string, string> OnActionRejected;
 
     // ─── State ───────────────────────────────────────────────────────
 
     private static bool _configured = false;
     private static string _sessionId = null;
+    private static string[] _players = new string[0];
+    private static int _round = 0;
 
     /// <summary>Whether Configure() has been called.</summary>
     public static bool IsConfigured => _configured;
 
-    /// <summary>The session ID assigned by the platform after Configure().</summary>
+    /// <summary>The current session id (changes for each rematch round).</summary>
     public static string SessionId => _sessionId;
+
+    /// <summary>Player ids in seat order, as of the last game start.</summary>
+    public static string[] Players => (string[])_players.Clone();
+
+    /// <summary>Round number in the current series (1 for the first game).</summary>
+    public static int Round => _round;
 
     // ─── JS Bridge (WebGL only) ──────────────────────────────────────
 
@@ -131,15 +214,17 @@ public static class RcadiaAgent
 
     [DllImport("__Internal")]
     private static extern void RcadiaAgent_EndGame(string resultJson);
+
+    [DllImport("__Internal")]
+    private static extern void RcadiaAgent_Rematch();
 #endif
 
     // ─── Public API ──────────────────────────────────────────────────
 
     /// <summary>
-    /// Declare that this game supports agent play. Call once at game start.
-    /// The platform will create a game session and assign a session ID.
+    /// Declare that this game supports agent play. Call once at startup.
+    /// The platform creates a session; OnGameStart fires when every seat is filled.
     /// </summary>
-    /// <param name="config">Game configuration (players, turn-based, type, timeout).</param>
     public static void Configure(AgentGameConfig config)
     {
         if (_configured)
@@ -148,6 +233,8 @@ public static class RcadiaAgent
             return;
         }
 
+        if (config == null) config = new AgentGameConfig();
+        config.sdkVersion = Version;
         _configured = true;
         string json = JsonUtility.ToJson(config);
 
@@ -159,12 +246,9 @@ public static class RcadiaAgent
     }
 
     /// <summary>
-    /// Push the authoritative game state. Call whenever state changes.
-    /// This is the full state — stored server-side and used for spectator views.
-    /// For games with hidden information, also call SetObservation() to push
-    /// filtered per-player views.
+    /// Push the public, authoritative state. Call whenever it changes. Spectators see this.
+    /// For hidden information, also call SetObservation() for each player.
     /// </summary>
-    /// <param name="stateJson">JSON string representing current game state.</param>
     public static void SetState(string stateJson)
     {
         if (!_configured)
@@ -181,13 +265,9 @@ public static class RcadiaAgent
     }
 
     /// <summary>
-    /// Push a per-player observation (filtered view of game state).
-    /// Use this for games with hidden information — each agent only sees
-    /// their own observation, never the full state or other players' observations.
-    /// If a game never calls SetObservation(), agents receive SetState() data instead.
+    /// Push one player's private view. That agent sees it instead of the state.
+    /// If a game never calls SetObservation(), agents receive the SetState() data.
     /// </summary>
-    /// <param name="playerId">The player this observation is for.</param>
-    /// <param name="observationJson">JSON string with this player's view of the game.</param>
     public static void SetObservation(string playerId, string observationJson)
     {
         if (!_configured)
@@ -204,11 +284,10 @@ public static class RcadiaAgent
     }
 
     /// <summary>
-    /// Declare what a specific player can do right now.
-    /// Pass an empty array or null when it's not their turn.
+    /// Declare what a player can do now (a JSON array; each entry should be an action the
+    /// agent can submit as-is). In sequential turn-based games this also puts that player
+    /// on turn and clears everyone else, so call it only for the player on turn.
     /// </summary>
-    /// <param name="playerId">The player this applies to.</param>
-    /// <param name="actionsJson">JSON array of legal actions.</param>
     public static void SetLegalActions(string playerId, string actionsJson)
     {
         if (!_configured)
@@ -225,12 +304,9 @@ public static class RcadiaAgent
     }
 
     /// <summary>
-    /// Reject an action submitted by a player. Call this from your OnAction
-    /// handler when the action is invalid. The platform relays the rejection
-    /// back to the agent with the reason, so it can retry.
+    /// Reject a player's last action. The agent gets the reason and is back on turn with the
+    /// same deadline. Call it from your OnAction handler instead of applying the action.
     /// </summary>
-    /// <param name="playerId">The player whose action was rejected.</param>
-    /// <param name="reason">Human-readable reason (e.g., "Not enough mana").</param>
     public static void RejectAction(string playerId, string reason)
     {
         if (!_configured)
@@ -247,9 +323,8 @@ public static class RcadiaAgent
     }
 
     /// <summary>
-    /// Report that the game is over. Call once when the game ends.
+    /// Report the result once, when the game ends. Use playerIds for "winner" (null for a draw).
     /// </summary>
-    /// <param name="resultJson">JSON string with game result (winner, scores, etc.).</param>
     public static void EndGame(string resultJson)
     {
         if (!_configured)
@@ -265,46 +340,130 @@ public static class RcadiaAgent
 #endif
     }
 
-    // ─── Callbacks from JS bridge ────────────────────────────────────
-
     /// <summary>
-    /// Called from the JavaScript bridge when the platform assigns a session ID.
-    /// Do not call this directly.
+    /// Ask for another round with the same players. Not needed when configured with
+    /// autoRematch. OnGameStart fires when the new round starts.
     /// </summary>
-    public static void ReceiveSessionStart(string sessionId)
+    public static void Rematch()
     {
-        _sessionId = sessionId;
-        Debug.Log($"[RcadiaAgent] Session started: {sessionId}");
-    }
-
-    /// <summary>
-    /// Called from the JavaScript bridge when an agent or human submits an action.
-    /// Do not call this directly.
-    /// </summary>
-    /// <param name="payload">Format: "playerId|actionJson"</param>
-    public static void ReceiveAction(string payload)
-    {
-        int sep = payload.IndexOf('|');
-        if (sep <= 0)
+        if (!_configured)
         {
-            Debug.LogWarning($"[RcadiaAgent] Invalid action payload: {payload}");
+            Debug.LogWarning("[RcadiaAgent] Rematch() called before Configure(). Ignoring.");
             return;
         }
 
-        string playerId = payload.Substring(0, sep);
-        string actionJson = payload.Substring(sep + 1);
+#if UNITY_WEBGL && !UNITY_EDITOR
+        RcadiaAgent_Rematch();
+#else
+        Debug.Log("[RcadiaAgent] Rematch");
+#endif
+    }
 
-        Debug.Log($"[RcadiaAgent] Action from {playerId}: {actionJson}");
-        OnAction?.Invoke(playerId, actionJson);
+    // ─── Callbacks from the JS bridge (via RcadiaAgentReceiver) ──────
+    // Do not call these directly except to simulate the platform in the Editor.
+
+    /// <summary>
+    /// A session exists (players may still be joining).
+    /// Payload: {"sessionId","round","players"} JSON, or a bare session id (v1 bridge).
+    /// </summary>
+    public static void ReceiveSessionStart(string payload)
+    {
+        if (string.IsNullOrEmpty(payload)) return;
+
+        if (payload[0] == '{')
+        {
+            RcadiaAgentSessionInfo info = ParseJson<RcadiaAgentSessionInfo>(payload);
+            if (info == null) return;
+            if (!string.IsNullOrEmpty(info.sessionId)) _sessionId = info.sessionId;
+            if (info.round > 0) _round = info.round;
+            if (info.players != null) _players = (string[])info.players.Clone();
+        }
+        else
+        {
+            _sessionId = payload;
+        }
+
+        Debug.Log($"[RcadiaAgent] Session started: {_sessionId}");
     }
 
     /// <summary>
-    /// Called from the JavaScript bridge when the platform rejects an action.
-    /// Do not call this directly.
+    /// Every seat is filled. Payload: {"sessionId","round","players"} JSON.
+    /// Without an OnGameStart subscriber the start is delivered to OnAction as the v1
+    /// system action {"type":"__game_start__","players":[...]} from "__system__".
     /// </summary>
-    /// <param name="payload">Format: "playerId|reason"</param>
+    public static void ReceiveGameStart(string payload)
+    {
+        RcadiaAgentSessionInfo info = string.IsNullOrEmpty(payload)
+            ? null
+            : ParseJson<RcadiaAgentSessionInfo>(payload);
+        if (info == null) info = new RcadiaAgentSessionInfo();
+
+        if (!string.IsNullOrEmpty(info.sessionId)) _sessionId = info.sessionId;
+        _players = info.players != null ? (string[])info.players.Clone() : new string[0];
+        _round = info.round > 0 ? info.round : (_round > 0 ? _round : 1);
+
+        Debug.Log($"[RcadiaAgent] Game start: round {_round}, {_players.Length} players");
+
+        if (OnGameStart != null)
+        {
+            OnGameStart.Invoke(_sessionId, (string[])_players.Clone(), _round);
+            return;
+        }
+
+        // v1 games learn their players from this system action.
+        string legacyJson = "{\"type\":\"__game_start__\",\"players\":" + JsonStringArray(_players) + "}";
+        OnAction?.Invoke("__system__", legacyJson);
+        OnActionDetail?.Invoke("__system__", legacyJson, null);
+    }
+
+    /// <summary>
+    /// A player's action. Payload: {"playerId","actionId","actionJson"} JSON,
+    /// or "playerId|actionJson" (v1 bridge).
+    /// </summary>
+    public static void ReceiveAction(string payload)
+    {
+        if (string.IsNullOrEmpty(payload)) return;
+
+        string playerId;
+        string actionJson;
+        string actionId = null;
+
+        if (payload[0] == '{')
+        {
+            RcadiaAgentActionInfo info = ParseJson<RcadiaAgentActionInfo>(payload);
+            if (info == null || string.IsNullOrEmpty(info.playerId))
+            {
+                Debug.LogWarning($"[RcadiaAgent] Invalid action payload: {payload}");
+                return;
+            }
+            playerId = info.playerId;
+            actionJson = info.actionJson ?? "null";
+            if (!string.IsNullOrEmpty(info.actionId)) actionId = info.actionId;
+        }
+        else
+        {
+            int sep = payload.IndexOf('|');
+            if (sep <= 0)
+            {
+                Debug.LogWarning($"[RcadiaAgent] Invalid action payload: {payload}");
+                return;
+            }
+            playerId = payload.Substring(0, sep);
+            actionJson = payload.Substring(sep + 1);
+        }
+
+        Debug.Log($"[RcadiaAgent] Action from {playerId}: {actionJson}");
+        OnAction?.Invoke(playerId, actionJson);
+        OnActionDetail?.Invoke(playerId, actionJson, actionId);
+    }
+
+    /// <summary>
+    /// Payload: "playerId|reason". Kept for v1; the platform does not send rejections to games.
+    /// </summary>
     public static void ReceiveActionRejected(string payload)
     {
+        if (string.IsNullOrEmpty(payload)) return;
+
         int sep = payload.IndexOf('|');
         if (sep <= 0)
         {
@@ -320,12 +479,99 @@ public static class RcadiaAgent
     }
 
     /// <summary>
-    /// Called from the JavaScript bridge when a player's turn times out.
-    /// Do not call this directly.
+    /// The player on turn ran out of time.
+    /// Payload: {"playerId","strike","maxStrikes","final"} JSON, or a bare playerId (v1 bridge).
     /// </summary>
-    public static void ReceiveTimeout(string playerId)
+    public static void ReceiveTimeout(string payload)
     {
-        Debug.Log($"[RcadiaAgent] Timeout for {playerId}");
-        OnTimeout?.Invoke(playerId);
+        if (string.IsNullOrEmpty(payload)) return;
+
+        RcadiaAgentTimeoutInfo info;
+        if (payload[0] == '{')
+        {
+            info = ParseJson<RcadiaAgentTimeoutInfo>(payload);
+            if (info == null || string.IsNullOrEmpty(info.playerId)) return;
+        }
+        else
+        {
+            info = new RcadiaAgentTimeoutInfo { playerId = payload };
+        }
+
+        Debug.Log($"[RcadiaAgent] Timeout for {info.playerId}: strike {info.strike}" +
+                  (info.maxStrikes > 0 ? $" of {info.maxStrikes}" : "") + (info.final ? " (final)" : ""));
+        OnTimeout?.Invoke(info.playerId);
+        OnTimeoutDetail?.Invoke(info.playerId, info.strike, info.maxStrikes, info.final);
+    }
+
+    /// <summary>
+    /// The platform ended the game. Payload: {"sessionId","resultJson","reason"} JSON.
+    /// </summary>
+    public static void ReceiveSessionEnd(string payload)
+    {
+        RcadiaAgentSessionEndInfo info = string.IsNullOrEmpty(payload)
+            ? null
+            : ParseJson<RcadiaAgentSessionEndInfo>(payload);
+        if (info == null) info = new RcadiaAgentSessionEndInfo();
+
+        string sessionId = string.IsNullOrEmpty(info.sessionId) ? _sessionId : info.sessionId;
+        string resultJson = string.IsNullOrEmpty(info.resultJson) ? "null" : info.resultJson;
+        string reason = string.IsNullOrEmpty(info.reason) ? null : info.reason;
+
+        Debug.Log($"[RcadiaAgent] Session ended ({reason ?? "unknown"}): {resultJson}");
+        OnSessionEnd?.Invoke(sessionId, resultJson, reason);
+    }
+
+    // ─── Helpers ─────────────────────────────────────────────────────
+
+    private static T ParseJson<T>(string json) where T : class
+    {
+        try
+        {
+            return JsonUtility.FromJson<T>(json);
+        }
+        catch (Exception err)
+        {
+            Debug.LogWarning($"[RcadiaAgent] Could not parse {typeof(T).Name}: {err.Message}");
+            return null;
+        }
+    }
+
+    private static string JsonStringArray(string[] values)
+    {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (i > 0) sb.Append(',');
+            AppendJsonString(sb, values[i]);
+        }
+        sb.Append(']');
+        return sb.ToString();
+    }
+
+    private static void AppendJsonString(StringBuilder sb, string value)
+    {
+        if (value == null)
+        {
+            sb.Append("null");
+            return;
+        }
+
+        sb.Append('"');
+        foreach (char c in value)
+        {
+            switch (c)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                    else sb.Append(c);
+                    break;
+            }
+        }
+        sb.Append('"');
     }
 }

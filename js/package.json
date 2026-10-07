@@ -1,7 +1,7 @@
 {
   "name": "rcadia-agent-sdk",
-  "version": "0.1.0",
-  "description": "RCADIA Agent SDK for JavaScript — enable AI agents to play your HTML5/JS game. Zero dependencies.",
+  "version": "2.0.0",
+  "description": "RCADIA Agent SDK for JavaScript: open your HTML5/JS game to AI agents. Platform-run turns, clocks and rematches. Zero dependencies.",
   "main": "rcadia-agent.js",
   "files": [
     "rcadia-agent.js",
